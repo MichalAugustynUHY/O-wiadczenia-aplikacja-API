@@ -21,6 +21,7 @@ from pdf2image import convert_from_path
 import tempfile
 import random
 from reportlab.lib.pagesizes import A4
+import sharepoint_sync
 
 # ------------------------- Get Desktop Path -------------------------
 CSIDL_DESKTOP = 0
@@ -65,91 +66,79 @@ def find_app_folder():
 
 base_dir = find_app_folder()
 
-# Excel data file and signatures folder
-input_excel_path = os.path.join(base_dir, "Dane sharepoint.xlsx")
+# Signatures folder (client data comes from SharePoint, see sharepoint_sync.py)
 signature_dir = os.path.join(base_dir, "podpisy")
 
-# ------------------------- Excel Refresh Function -------------------------
-def refresh_excel_file(file_path, progress):
-    pythoncom.CoInitialize()
-    excel = win32.Dispatch("Excel.Application")
-    excel.Visible = False
-    excel.DisplayAlerts = False
-    wb = None
-    try:
-        # Jasny komunikat, gdy pliku nie ma pod obliczoną ścieżką
-        if not os.path.exists(file_path):
-            messagebox.showerror(
-                "Error",
-                "Nie znaleziono pliku danych:\n" + file_path + "\n\n"
-                "Sprawdź, czy folder \"" + APP_FOLDER_NAME + "\" (z plikiem "
-                "\"Dane sharepoint.xlsx\") znajduje się w OneDrive lub na Pulpicie."
-            )
-            return
-
-        progress['value'] = 10
-        progress.update_idletasks()
-
-        wb = excel.Workbooks.Open(os.path.abspath(file_path))
-        progress['value'] = 30
-        progress.update_idletasks()
-
-        wb.RefreshAll()  # Refresh all data connections
-        excel.CalculateUntilAsyncQueriesDone()
-        progress['value'] = 70
-        progress.update_idletasks()
-
-        wb.Save()
-        progress['value'] = 100
-        progress.update_idletasks()
-    except Exception as e:
-        messagebox.showerror("Error", f"Nie udało się odświeżyć danych: {e}")
-    finally:
-        if wb is not None:
-            wb.Close(False)
-        excel.Application.Quit()
-        pythoncom.CoUninitialize()
-
-def refresh_data():
-    progress_window = tk.Toplevel(root)
-    progress_window.title("Odświeżanie danych źródłowych")
-    progress_window.geometry("300x100")
-    progress_window.resizable(False, False)
-
-    progress_label = ttk.Label(progress_window, text="Odświeżanie danych listy źródłowej, proszę czekać...", anchor="center")
-    progress_label.pack(pady=10)
-
-    progress = ttk.Progressbar(progress_window, orient=tk.HORIZONTAL, length=250, mode='determinate')
-    progress.pack(pady=10)
-
-    def run_refresh():
-        refresh_excel_file(input_excel_path, progress)
-        progress_window.destroy()
-        load_data()
-
-    threading.Thread(target=run_refresh, daemon=True).start()
-
+# ------------------------- SharePoint Data -------------------------
 def load_data():
-    global data, client_names
+    """Load the local copy of the SharePoint list (kept in the user's AppData)."""
+    global data, client_names, data_synced_at
     try:
-        # Now try to load the file
-        data = pd.read_excel(input_excel_path)
-        client_names = data['Nazwa firmy'].dropna().astype(str).unique().tolist()
-        client_name_combobox['values'] = client_names
-    except PermissionError:
-        messagebox.showerror("Error",
-            "Nie można otworzyć pliku - jest on obecnie używany przez inny proces.\n\n" +
-            "Proszę:\n" +
-            "1. Zamknąć wszystkie okna Excel\n" +
-            "2. Sprawdzić czy plik nie jest otwarty w innym programie\n" +
-            "3. Spróbować ponownie")
+        data, data_synced_at = sharepoint_sync.load()
     except Exception as e:
         messagebox.showerror("Error", f"Błąd wczytywania danych: {e}")
+        data, data_synced_at = pd.DataFrame(columns=list(sharepoint_sync.COLUMNS)), None
+    client_names = data['Nazwa firmy'].dropna().astype(str).unique().tolist()
+    client_name_combobox['values'] = client_names
+
+def show_data_status(note=""):
+    if data_synced_at:
+        text = "Dane z SharePoint z " + datetime.fromisoformat(data_synced_at).strftime("%d.%m.%Y %H:%M")
+    else:
+        text = "Brak danych z SharePoint"
+    status_var.set(text + note)
+
+def refresh_data(full=True):
+    """Update the local copy from SharePoint in the background.
+
+    full=True ("Odśwież dane" button) downloads the whole list, otherwise only the changes."""
+    refresh_button.config(state=tk.DISABLED)
+    status_var.set("Pobieranie danych z SharePoint..." if full else "Sprawdzanie zmian w SharePoint...")
+    parent_window = int(root.wm_frame(), 16)  # the sign-in window, if needed, opens over the app
+    outcome = {}
+
+    def run_sync():
+        try:
+            outcome['result'] = sharepoint_sync.sync(full=full, parent_window_handle=parent_window)
+        except Exception as e:
+            outcome['error'] = e
+
+    worker = threading.Thread(target=run_sync, daemon=True)
+    worker.start()
+    root.after(200, finish_refresh, worker, outcome, full)
+
+def finish_refresh(worker, outcome, full):
+    # tkinter may only be used from the main thread, so wait for the worker here
+    # instead of updating the window from it.
+    if worker.is_alive():
+        root.after(200, finish_refresh, worker, outcome, full)
+        return
+    refresh_button.config(state=tk.NORMAL)
+    if 'error' in outcome:
+        show_data_status(" (nie udało się zaktualizować)")
+        if full or data.empty:
+            messagebox.showerror("Error", f"Nie udało się pobrać danych z SharePoint: {outcome['error']}")
+        return
+    print("Synchronizacja z SharePoint:", outcome['result'])
+    load_data()
+    show_data_status()
 
 # ------------------------- Helper Functions -------------------------
 def add_signature(sheet, image_path, cell):
     img = OpenpyxlImage(image_path)
     sheet.add_image(img, cell)
+
+def normalize_name(name):
+    # SharePoint and the signature file names do not always agree on spacing
+    # (e.g. "Michał Augustyn" vs "Michał  Augustyn_czarny_1.png").
+    return " ".join(name.split()).casefold()
+
+def find_signatures(signer, color):
+    if not os.path.isdir(signature_dir):
+        return []
+    wanted = {normalize_name(f"{signer}_{color}_{j}.png") for j in range(1, 4)}
+    return [os.path.join(signature_dir, file_name) for file_name in os.listdir(signature_dir)
+            if normalize_name(file_name) in wanted]
 
 # ------------------------- Scanned Effect Function -------------------------
 def add_scanned_effect(img):
@@ -395,11 +384,7 @@ def process_form(selected_client, display_client, dzien_otw_bil, dzien_bil, audi
     signature_color = signature_color_var.get()
     
     for i, signer in enumerate(selected_signers):
-        available_signatures = []
-        for j in range(1, 4):
-            candidate_path = os.path.join(signature_dir, f"{signer}_{signature_color}_{j}.png")
-            if os.path.exists(candidate_path):
-                available_signatures.append(candidate_path)
+        available_signatures = find_signatures(signer, signature_color)
         if not available_signatures:
             print(f"Podpis dla {signer} nie został znaleziony.")
             continue
@@ -685,5 +670,11 @@ exit_button = ttk.Button(button_frame, text="Wyjdź", command=root.quit)
 exit_button.grid(row=0, column=2, padx=10)
 button_frame.columnconfigure((0, 1, 2), weight=1)
 
-refresh_data()
+status_var = tk.StringVar()
+ttk.Label(main_frame, textvariable=status_var, foreground="gray").grid(row=6, column=0, columnspan=2)
+
+# Show the local copy right away, then fetch what changed in SharePoint since the last run.
+load_data()
+show_data_status()
+root.after(100, refresh_data, False)  # once the window is shown, so the sign-in window can open over it
 root.mainloop()

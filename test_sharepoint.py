@@ -1,72 +1,19 @@
+"""Diagnostic: download the whole SharePoint list (all columns), independent of the app's local copy."""
 import argparse
-import os
 import sys
 
-import msal
 import pandas as pd
-import requests
-from msal_extensions import PersistedTokenCache, build_encrypted_persistence
 
-# ------------------------- Configuration -------------------------
-# Values taken from the data connection stored in "Dane sharepoint.xlsx".
-SERVER_URL = "https://uhypl.sharepoint.com"
-SITE_URL = SERVER_URL + "/sites/DAA"
-LIST_ID = "5b1a818d-9b0b-4a9e-8cbe-396f485f0e66"
-
-TENANT = "uhy-pl.com"
-# Application (client) ID of the app registration - paste it here or set SP_CLIENT_ID.
-CLIENT_ID = os.environ.get("SP_CLIENT_ID") or "d73af729-3bb4-445e-b763-e6a49097dd0c"
-SCOPES = [SERVER_URL + "/.default"]
-TOKEN_CACHE_PATH = os.path.join(os.environ.get("LOCALAPPDATA", os.path.expanduser("~")),
-                                "Oswiadczenia", "sharepoint_token_cache.bin")
-LOCAL_TZ = "Europe/Warsaw"  # SharePoint returns dates in UTC
+from sharepoint_sync import COLUMNS, LIST_URL, LOCAL_TZ, open_session, sign_out, sp_get
 
 # Columns Oświadczenia.py relies on - the test checks they are present.
-REQUIRED_COLUMNS = [
-    "Nazwa firmy",
-    "Data rozpoczęcia",
-    "Osoba odpowiedzialna",
-    "Typ zadania",
-    "Rodzaj sprawozdania",
-]
+REQUIRED_COLUMNS = list(COLUMNS)
 # Built-in columns worth keeping; other built-in ones (Author, Attachments, ...) are skipped.
 BASE_FIELDS_TO_KEEP = {"ID", "Title", "Created", "Modified"}
 LOOKUP_TYPES = ("User", "UserMulti", "Lookup", "LookupMulti")
 
 
-# ------------------------- Sign-in -------------------------
-def get_token(logout=False):
-    cache = PersistedTokenCache(build_encrypted_persistence(TOKEN_CACHE_PATH))
-    app = msal.PublicClientApplication(
-        CLIENT_ID,
-        authority=f"https://login.microsoftonline.com/{TENANT}",
-        token_cache=cache,
-    )
-    accounts = app.get_accounts()
-
-    if logout:
-        for account in accounts:
-            app.remove_account(account)
-        return None
-
-    result = app.acquire_token_silent(SCOPES, account=accounts[0]) if accounts else None
-    if not result:
-        print("Opening the browser for Microsoft 365 sign-in...")
-        result = app.acquire_token_interactive(SCOPES)
-
-    if "access_token" not in result:
-        raise RuntimeError(f"{result.get('error')}: {result.get('error_description')}")
-    return result["access_token"]
-
-
 # ------------------------- SharePoint REST -------------------------
-def sp_get(session, url, params=None):
-    response = session.get(url, params=params, timeout=60)
-    if not response.ok:
-        raise RuntimeError(f"HTTP {response.status_code} for {response.url}\n{response.text[:500]}")
-    return response.json()
-
-
 def lookup_target(field):
     """Property of an expanded person/lookup value that holds the display text."""
     if field["TypeAsString"].startswith("User"):
@@ -75,8 +22,7 @@ def lookup_target(field):
 
 
 def get_fields(session):
-    data = sp_get(session, f"{SITE_URL}/_api/web/lists(guid'{LIST_ID}')/fields",
-                  {"$filter": "Hidden eq false"})
+    data = sp_get(session, f"{LIST_URL}/fields", {"$filter": "Hidden eq false"})
     return [f for f in data["value"]
             if f["TypeAsString"] != "Computed"
             and (not f["FromBaseType"] or f["InternalName"] in BASE_FIELDS_TO_KEEP)]
@@ -92,7 +38,7 @@ def get_items(session, fields, row_limit):
     if lookups:
         params["$expand"] = ",".join(f["InternalName"] for f in lookups)
 
-    url = f"{SITE_URL}/_api/web/lists(guid'{LIST_ID}')/items"
+    url = f"{LIST_URL}/items"
     items = []
     while url:
         data = sp_get(session, url, params)
@@ -135,29 +81,23 @@ def to_dataframe(items, fields):
 # ------------------------- Main -------------------------
 def main():
     parser = argparse.ArgumentParser(description="Read the SharePoint list via REST API.")
-    parser.add_argument("--rows", type=int, default=200, help="row limit, 0 = all rows")
+    parser.add_argument("--rows", type=int, default=0, help="row limit, 0 = all rows")
     parser.add_argument("--csv", default=None, help="optional path to save the rows as CSV")
     parser.add_argument("--logout", action="store_true", help="forget the cached sign-in")
     args = parser.parse_args()
 
-    if not CLIENT_ID:
-        print("CLIENT_ID is not set. Create the app registration described at the top of "
-              "this file and set SP_CLIENT_ID (or CLIENT_ID in the script).")
-        return 1
+    if args.logout:
+        sign_out()
+        print("Cached sign-in removed.")
+        return 0
 
     try:
-        token = get_token(logout=args.logout)
+        session = open_session()
     except Exception as e:
         print(f"FAILED to sign in: {e}")
         return 1
-    if args.logout:
-        print("Cached sign-in removed.")
-        return 0
     print("Signed in.")
 
-    session = requests.Session()
-    session.headers.update({"Authorization": f"Bearer {token}",
-                            "Accept": "application/json;odata=nometadata"})
     try:
         fields = get_fields(session)
         items = get_items(session, fields, args.rows)

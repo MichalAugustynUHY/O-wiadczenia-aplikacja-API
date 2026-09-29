@@ -1,4 +1,6 @@
 import os
+import re
+import json
 import pandas as pd
 import openpyxl
 from openpyxl.drawing.image import Image as OpenpyxlImage
@@ -21,6 +23,7 @@ from pdf2image import convert_from_path
 import tempfile
 import random
 from reportlab.lib.pagesizes import A4
+from reportlab.lib.utils import ImageReader
 import sharepoint_sync
 
 # ------------------------- Get Desktop Path -------------------------
@@ -68,6 +71,61 @@ base_dir = find_app_folder()
 
 # Signatures folder (client data comes from SharePoint, see sharepoint_sync.py)
 signature_dir = os.path.join(base_dir, "podpisy")
+# Last used choices, remembered per user
+settings_path = os.path.join(sharepoint_sync.DATA_DIR, "ustawienia.json")
+
+# ------------------------- Background Work -------------------------
+def run_in_background(work, on_done):
+    """Run work() in a worker thread, then call on_done(result, error) in the main thread."""
+    outcome = {}
+
+    def worker():
+        try:
+            outcome['result'] = work()
+        except Exception as e:
+            outcome['error'] = e
+
+    thread = threading.Thread(target=worker, daemon=True)
+    thread.start()
+
+    def wait():
+        # tkinter may only be used from the main thread, so wait for the worker here
+        # instead of updating the window from it.
+        if thread.is_alive():
+            root.after(100, wait)
+        else:
+            on_done(outcome.get('result'), outcome.get('error'))
+    root.after(100, wait)
+
+def show_busy(text):
+    """Small window with a moving progress bar that blocks the app until it is destroyed."""
+    busy = tk.Toplevel(root)
+    busy.title("Proszę czekać")
+    busy.resizable(False, False)
+    busy.transient(root)
+    busy.protocol("WM_DELETE_WINDOW", lambda: None)
+    ttk.Label(busy, text=text).pack(padx=20, pady=(15, 5))
+    progress = ttk.Progressbar(busy, mode='indeterminate', length=250)
+    progress.pack(padx=20, pady=(0, 15))
+    progress.start(10)
+    busy.grab_set()
+    return busy
+
+# ------------------------- Settings -------------------------
+def load_settings():
+    try:
+        with open(settings_path, encoding="utf-8") as f:
+            return json.load(f)
+    except (OSError, ValueError):
+        return {}
+
+def save_settings(**settings):
+    try:
+        os.makedirs(os.path.dirname(settings_path), exist_ok=True)
+        with open(settings_path, "w", encoding="utf-8") as f:
+            json.dump(settings, f, ensure_ascii=False)
+    except OSError:
+        pass  # remembering the choices is only a convenience
 
 # ------------------------- SharePoint Data -------------------------
 def load_data():
@@ -78,8 +136,18 @@ def load_data():
     except Exception as e:
         messagebox.showerror("Error", f"Błąd wczytywania danych: {e}")
         data, data_synced_at = pd.DataFrame(columns=list(sharepoint_sync.COLUMNS)), None
-    client_names = data['Nazwa firmy'].dropna().astype(str).unique().tolist()
+    # The same client is sometimes typed with different spacing or letter case: group
+    # those rows under one key and list the client once, under its most common spelling.
+    data['client_key'] = data['Nazwa firmy'].fillna('').map(normalize_name)
+    spellings = (data.groupby(['client_key', 'Nazwa firmy']).size()
+                 .sort_values(ascending=False, kind='stable').reset_index())
+    client_names = sorted((" ".join(name.split()) for name in
+                           spellings.drop_duplicates('client_key')['Nazwa firmy']), key=str.casefold)
     client_name_combobox['values'] = client_names
+
+def client_rows(client_name):
+    """All rows of a client, whichever spelling of the name they use."""
+    return data[data['client_key'] == normalize_name(client_name)]
 
 def show_data_status(note=""):
     if data_synced_at:
@@ -95,33 +163,19 @@ def refresh_data(full=True):
     refresh_button.config(state=tk.DISABLED)
     status_var.set("Pobieranie danych z SharePoint..." if full else "Sprawdzanie zmian w SharePoint...")
     parent_window = int(root.wm_frame(), 16)  # the sign-in window, if needed, opens over the app
-    outcome = {}
 
-    def run_sync():
-        try:
-            outcome['result'] = sharepoint_sync.sync(full=full, parent_window_handle=parent_window)
-        except Exception as e:
-            outcome['error'] = e
+    def on_done(result, error):
+        refresh_button.config(state=tk.NORMAL)
+        if error:
+            show_data_status(" (nie udało się zaktualizować)")
+            if full or data.empty:
+                messagebox.showerror("Error", f"Nie udało się pobrać danych z SharePoint: {error}")
+            return
+        print("Synchronizacja z SharePoint:", result)
+        load_data()
+        show_data_status()
 
-    worker = threading.Thread(target=run_sync, daemon=True)
-    worker.start()
-    root.after(200, finish_refresh, worker, outcome, full)
-
-def finish_refresh(worker, outcome, full):
-    # tkinter may only be used from the main thread, so wait for the worker here
-    # instead of updating the window from it.
-    if worker.is_alive():
-        root.after(200, finish_refresh, worker, outcome, full)
-        return
-    refresh_button.config(state=tk.NORMAL)
-    if 'error' in outcome:
-        show_data_status(" (nie udało się zaktualizować)")
-        if full or data.empty:
-            messagebox.showerror("Error", f"Nie udało się pobrać danych z SharePoint: {outcome['error']}")
-        return
-    print("Synchronizacja z SharePoint:", outcome['result'])
-    load_data()
-    show_data_status()
+    run_in_background(lambda: sharepoint_sync.sync(full=full, parent_window_handle=parent_window), on_done)
 
 # ------------------------- Helper Functions -------------------------
 def add_signature(sheet, image_path, cell):
@@ -129,7 +183,8 @@ def add_signature(sheet, image_path, cell):
     sheet.add_image(img, cell)
 
 def normalize_name(name):
-    # SharePoint and the signature file names do not always agree on spacing
+    # Names are compared ignoring letter case and extra spaces: SharePoint, the signature
+    # files and the client names typed in SharePoint do not always agree on them
     # (e.g. "Michał Augustyn" vs "Michał  Augustyn_czarny_1.png").
     return " ".join(name.split()).casefold()
 
@@ -140,6 +195,17 @@ def find_signatures(signer, color):
     return [os.path.join(signature_dir, file_name) for file_name in os.listdir(signature_dir)
             if normalize_name(file_name) in wanted]
 
+def safe_filename(name):
+    """The name with the characters Windows does not allow in file and folder names replaced."""
+    return re.sub(r'[<>:/\\|?*\x00-\x1f]', '_', name.replace('"', "'")).strip()
+
+def parse_date(text):
+    """Date from DD.MM.YYYY text, or None when the text is not such a date."""
+    try:
+        return datetime.strptime(text.strip(), '%d.%m.%Y').date()
+    except ValueError:
+        return None
+
 # ------------------------- Scanned Effect Function -------------------------
 def add_scanned_effect(img):
     # Slight random rotation
@@ -148,10 +214,9 @@ def add_scanned_effect(img):
     # Add slight blur
     img = img.filter(ImageFilter.GaussianBlur(radius=0.7))
     # Add noise
-    arr = np.array(img)
-    noise = np.random.normal(0, 8, arr.shape).astype(np.int16)
-    arr = np.clip(arr + noise, 0, 255).astype(np.uint8)
-    img = Image.fromarray(arr)
+    arr = np.asarray(img, dtype=np.int16)
+    arr += np.random.default_rng().normal(0, 8, arr.shape).astype(np.int16)
+    img = Image.fromarray(np.clip(arr, 0, 255).astype(np.uint8))
     # Adjust contrast and brightness
     enhancer = ImageEnhance.Contrast(img)
     img = enhancer.enhance(1.15)
@@ -163,12 +228,9 @@ def add_scanned_effect(img):
 def normalize_task_type(value):
     return str(value).strip().lower() if pd.notnull(value) else ''
 
-def get_client_records(client_name, audit_type=None, dzien_otw_bil=None):
+def get_client_records(client_name):
     records = []
-    for _, row in data[data['Nazwa firmy'] == client_name].iterrows():
-        if audit_type and "przegląd" in audit_type.lower():
-            if row['Data rozpoczęcia'].year != int(dzien_otw_bil[-4:]):
-                continue
+    for _, row in client_rows(client_name).iterrows():
         records.append({
             'signer_name': row['Osoba odpowiedzialna'],
             'task_type': row['Typ zadania'],
@@ -187,7 +249,7 @@ def compute_earliest_date(signer_data_list, client_name):
 
 # ------------------------- Signer Selection Dialog -------------------------
 def open_signer_selection_dialog(client_name, dzien_otw_bil, dzien_bil, audit_type, data_podpisu_umowy, data_podpisu_badania):
-    client_records = data[data['Nazwa firmy'] == client_name].copy()
+    client_records = client_rows(client_name).copy()
     if client_records.empty:
         messagebox.showerror("Error", f"Nie znaleziono danych dla klienta: {client_name}")
         return
@@ -198,18 +260,19 @@ def open_signer_selection_dialog(client_name, dzien_otw_bil, dzien_bil, audit_ty
     if computed_earliest_date is None:
         return
 
+    # Only tasks other than "Oświadczenie" make someone a signer, both here and when a row is selected.
     signer_tasks = defaultdict(list)
     for entry in signer_data_list:
-        signer_tasks[entry['signer_name']].append({
-            'task_type': entry['task_type'],
-            'appearance_date': entry['appearance_date']
-        })
+        if normalize_task_type(entry['task_type']) != "oświadczenie" and isinstance(entry['signer_name'], str):
+            signer_tasks[entry['signer_name']].append({
+                'task_type': entry['task_type'],
+                'appearance_date': entry['appearance_date']
+            })
+    valid_signers = list(signer_tasks)
 
-    valid_signers = []
-    for signer, tasks in signer_tasks.items():
-        non_oswiadczenie_tasks = [task for task in tasks if normalize_task_type(task['task_type']) != "oświadczenie"]
-        if non_oswiadczenie_tasks:
-            valid_signers.append(signer)
+    # People without a signature file in the chosen colour are shown, but cannot be selected.
+    signature_color = signature_color_var.get()
+    missing_signature = {signer for signer in valid_signers if not find_signatures(signer, signature_color)}
 
     sel_dialog = tk.Toplevel(root)
     sel_dialog.title("Wybór daty i podpisujących")
@@ -239,10 +302,13 @@ def open_signer_selection_dialog(client_name, dzien_otw_bil, dzien_bil, audit_ty
     client_records['Data rozpoczęcia'] = pd.to_datetime(client_records['Data rozpoczęcia'], errors='coerce')
     client_records = client_records.sort_values(by='Data rozpoczęcia')
 
-    # Insert records
+    # Insert records, remembering each row's date (the shown DD.MM.YYYY text is not parsed back)
+    row_dates = {}
     for idx, row in client_records.iterrows():
-        date_str = row['Data rozpoczęcia'].strftime("%Y-%m-%d") if pd.notnull(row['Data rozpoczęcia']) else ''
-        tree.insert("", "end", values=(date_str, row['Osoba odpowiedzialna'], row['Typ zadania'], row['Rodzaj sprawozdania']))
+        start = row['Data rozpoczęcia']
+        date_str = start.strftime("%d.%m.%Y") if pd.notnull(start) else ''
+        item = tree.insert("", "end", values=(date_str, row['Osoba odpowiedzialna'], row['Typ zadania'], row['Rodzaj sprawozdania']))
+        row_dates[item] = start
 
     # Options frame
     options_frame = ttk.LabelFrame(sel_dialog, text="Wybór osób podpisujących i daty", padding="10")
@@ -252,9 +318,12 @@ def open_signer_selection_dialog(client_name, dzien_otw_bil, dzien_bil, audit_ty
     checkbox_frame.grid(row=1, column=0, sticky=tk.W, padx=5, pady=5)
     signer_vars = {}
     for i, signer in enumerate(valid_signers):
-        var = tk.IntVar(value=1)
+        has_signature = signer not in missing_signature
+        var = tk.IntVar(value=int(has_signature))
         signer_vars[signer] = var
-        cb = ttk.Checkbutton(checkbox_frame, text=signer, variable=var)
+        cb = ttk.Checkbutton(checkbox_frame, variable=var,
+                             text=signer if has_signature else f"{signer} (brak podpisu: {signature_color})",
+                             state=tk.NORMAL if has_signature else tk.DISABLED)
         cb.grid(row=i // 3, column=i % 3, sticky=tk.W, padx=5, pady=2)
 
     ttk.Label(options_frame, text="Data kontaktu (pierwszego zlecenia):").grid(row=2, column=0, sticky=tk.W, padx=5, pady=5)
@@ -276,36 +345,37 @@ def open_signer_selection_dialog(client_name, dzien_otw_bil, dzien_bil, audit_ty
         item = tree.focus()
         if not item:
             return
-        values = tree.item(item, "values")
-        date_val = values[0]
-        try:
-            selected_date = pd.to_datetime(date_val)
-            formatted_date = selected_date.strftime("%d.%m.%Y")
-        except Exception:
-            formatted_date = str(date_val)
-            selected_date = None
-        custom_date_var.set(formatted_date)
-        # Automatically uncheck signers not having any record on or after the selected date
-        if selected_date is not None:
-            for signer, tasks in signer_tasks.items():
-                # If none of the tasks' appearance_date is greater or equal to selected_date, uncheck:
-                valid = any(pd.to_datetime(task['appearance_date']) >= selected_date for task in tasks)
-                if not valid:
-                    signer_vars[signer].set(0)
+        start = row_dates[item]
+        if pd.isnull(start):
+            custom_date_var.set('')
+            return
+        custom_date_var.set(start.strftime("%d.%m.%Y"))
+        # Check the signers having a task (other than "Oświadczenie") on or after the selected day
+        # and uncheck the others
+        selected_date = start.normalize()
+        for signer, var in signer_vars.items():
+            if signer not in missing_signature:
+                var.set(int(any(task['appearance_date'] >= selected_date for task in signer_tasks[signer])))
     tree.bind("<<TreeviewSelect>>", on_tree_select)
 
     # OK and Cancel buttons
     def on_ok():
         selected_signers = [signer for signer, var in signer_vars.items() if var.get() == 1]
         if not selected_signers:
-            messagebox.showerror("Error", "Musisz wybrać co najmniej jedną osobę podpisującą.")
+            messagebox.showerror("Error", "Musisz wybrać co najmniej jedną osobę podpisującą.", parent=sel_dialog)
+            return
+        contact_text = custom_date_var.get().strip()
+        contact_date = parse_date(contact_text) if contact_text else computed_earliest_date.date()
+        if contact_date is None:
+            messagebox.showerror("Error", "Nieprawidłowy format daty kontaktu. Użyj formatu DD.MM.YYYY.",
+                                 parent=sel_dialog)
             return
         sel_dialog.destroy()
         # Read the override client name for display only.
         display_client_name = client_name_override_var.get().strip()
         # Pass the original client name (for filtering) and the override (for display)
         process_form(client_name, display_client_name, dzien_otw_bil, dzien_bil, audit_type,
-                     data_podpisu_umowy, data_podpisu_badania, selected_signers, custom_date_var.get().strip())
+                     data_podpisu_umowy, data_podpisu_badania, selected_signers, signature_color, contact_date)
     def on_cancel():
         sel_dialog.destroy()
     btn_frame = ttk.Frame(sel_dialog)
@@ -314,20 +384,8 @@ def open_signer_selection_dialog(client_name, dzien_otw_bil, dzien_bil, audit_ty
     ttk.Button(btn_frame, text="Anuluj", command=on_cancel).grid(row=0, column=1, padx=10)
 
 # ------------------------- Process Form -------------------------
-def process_form(selected_client, display_client, dzien_otw_bil, dzien_bil, audit_type, 
-                 data_podpisu_umowy, data_podpisu_badania, selected_signers, custom_date_cell):
-    try:
-        data_podpisu_umowy = datetime.strptime(data_podpisu_umowy, '%d.%m.%Y').date()
-    except ValueError:
-        messagebox.showerror("Error", "Nieprawidłowy format daty podpisu umowy. Użyj formatu DD.MM.YYYY.")
-        return
-
-    signer_data_list = get_client_records(selected_client, audit_type, dzien_otw_bil)
-
-    earliest_date = compute_earliest_date(signer_data_list, selected_client)
-    if earliest_date is None:
-        return
-
+def process_form(selected_client, display_client, dzien_otw_bil, dzien_bil, audit_type,
+                 data_podpisu_umowy, data_podpisu_badania, selected_signers, signature_color, contact_date):
     skip_second_signature = na_dzien_podpisu_var.get() == 1
     if skip_second_signature:
         template_file = "Szablon dzien podpisu.xlsx"
@@ -355,16 +413,6 @@ def process_form(selected_client, display_client, dzien_otw_bil, dzien_bil, audi
     wb = openpyxl.load_workbook(template_path)
     ws = wb.active
 
-    if custom_date_cell:
-        try:
-            custom_date = datetime.strptime(custom_date_cell, '%d.%m.%Y').date()
-            date_to_use = custom_date
-        except ValueError:
-            messagebox.showerror("Error", "Nieprawidłowy format daty wpisanej. Użyj formatu DD.MM.YYYY.")
-            return
-    else:
-        date_to_use = earliest_date.date()
-
     # Write the client name to Excel – use display_client if provided, otherwise the original
     final_client_name = display_client if display_client else selected_client
     if grupa_kapitalowa_var.get():
@@ -372,7 +420,7 @@ def process_form(selected_client, display_client, dzien_otw_bil, dzien_bil, audi
     else:
         ws[name_cell] = final_client_name
 
-    ws[date_cell] = date_to_use
+    ws[date_cell] = contact_date
     ws[dzien_otw_bil_cell] = dzien_otw_bil
     ws[dzien_bil_cell] = dzien_bil
     ws[audit_type_cell] = audit_type
@@ -380,9 +428,6 @@ def process_form(selected_client, display_client, dzien_otw_bil, dzien_bil, audi
     if skip_second_signature:
         ws[data_podpisu_badania_cell] = data_podpisu_badania
 
-    # Get the selected signature color (global variable declared in the GUI setup)
-    signature_color = signature_color_var.get()
-    
     for i, signer in enumerate(selected_signers):
         available_signatures = find_signatures(signer, signature_color)
         if not available_signatures:
@@ -402,76 +447,9 @@ def process_form(selected_client, display_client, dzien_otw_bil, dzien_bil, audi
         if row[0].value is None:
             ws.row_dimensions[row[0].row].hidden = True
 
-    # Set the custom print area based on the template type.
-    if skip_second_signature:
-        # For "Szablon dzien podpisu.xlsx"
-        ws.print_area = 'A1:J32'
-    else:
-        # For "Szablon.xlsx"
-        ws.print_area = 'A1:I31'
-
-    filled_excel_path = 'oświadczenie.xlsx'
-    wb.save(filled_excel_path)
-
-    # ------------------------- PDF Export and Flattening -------------------------
-    def excel_to_pdf(excel_path, pdf_path, folder_path):
-        pythoncom.CoInitialize()
-        excel = win32.Dispatch("Excel.Application")
-        excel.Visible = False
-        excel.DisplayAlerts = False
-        wb_pdf = None
-        try:
-            wb_pdf = excel.Workbooks.Open(os.path.abspath(excel_path))
-            ws_pdf = wb_pdf.Worksheets(1)
-            # Set print area using Excel's COM interface
-            if skip_second_signature:
-                ws_pdf.PageSetup.PrintArea = "A1:J32"
-            else:
-                ws_pdf.PageSetup.PrintArea = "A1:I31"
-
-            ws_pdf.ExportAsFixedFormat(0, os.path.abspath(pdf_path))
-        finally:
-            if wb_pdf is not None:
-                wb_pdf.Close(False)
-            excel.Application.Quit()
-            pythoncom.CoUninitialize()
-
-        # Flatten the PDF by converting each page into an image and reassembling.
-        temp_flattened_pdf = "temp_flattened.pdf"
-        flatten_pdf(pdf_path, temp_flattened_pdf, dpi=300)
-        os.replace(temp_flattened_pdf, pdf_path)
-
-    def flatten_pdf(input_pdf_path, output_pdf_path, dpi=300):
-        # Convert PDF pages to images.
-        images = convert_from_path(input_pdf_path, dpi=dpi)
-        a4_width, a4_height = A4  # A4 page dimensions in points (approx. 595x842)
-        c = canvas.Canvas(output_pdf_path, pagesize=A4)
-        for img in images:
-            img = add_scanned_effect(img)
-            width, height = img.size  # in pixels
-            
-            # Convert pixel dimensions to points (72 points per inch).
-            img_width_pt = width * 72 / dpi
-            img_height_pt = height * 72 / dpi
-            
-            # Calculate scale to fit image into A4 while preserving aspect ratio.
-            scale = min(a4_width / img_width_pt, a4_height / img_height_pt)
-            scaled_width = img_width_pt * scale
-            scaled_height = img_height_pt * scale
-            
-            # Center the image on the A4 page.
-            x = (a4_width - scaled_width) / 2
-            y = (a4_height - scaled_height) / 2
-            
-            # Save the image temporarily.
-            temp_image_path = os.path.join(tempfile.gettempdir(), "temp_page.png")
-            img.save(temp_image_path, 'PNG')
-            
-            # Draw the image on an A4 page.
-            c.drawImage(temp_image_path, x, y, width=scaled_width, height=scaled_height)
-            c.showPage()
-            os.remove(temp_image_path)
-        c.save()
+    # Print area of "Szablon dzien podpisu.xlsx" / "Szablon.xlsx"
+    print_area = 'A1:J32' if skip_second_signature else 'A1:I31'
+    ws.print_area = print_area
 
     if grupa_kapitalowa_var.get():
         output_client_name = "Grupa kapitałowa " + selected_client
@@ -484,48 +462,129 @@ def process_form(selected_client, display_client, dzien_otw_bil, dzien_bil, audi
         initial_name = f'Oświadczenie_{output_client_name}.pdf'
 
     # Create the folder only once if it does not exist.
-    folder_path = os.path.join(desktop_path, f"Oświadczenia_{selected_client}")
-    if not os.path.exists(folder_path):
-        os.makedirs(folder_path)
+    folder_path = os.path.join(desktop_path, safe_filename(f"Oświadczenia_{selected_client}"))
+    os.makedirs(folder_path, exist_ok=True)
 
     # Set the default directory for the save dialog to folder_path.
     output_pdf_path = asksaveasfilename(
         defaultextension=".pdf",
         filetypes=[("PDF files", "*.pdf")],
         initialdir=folder_path,
-        initialfile=initial_name
+        initialfile=safe_filename(initial_name)
     )
-    
-    if output_pdf_path:
-        # Call excel_to_pdf without creating additional folders.
-        try:
-            excel_to_pdf(filled_excel_path, output_pdf_path, folder_path)
-        except Exception as e:
-            messagebox.showerror("Error", f"Nie udało się wyeksportować PDF: {e}")
-            return
-        finally:
-            os.remove(filled_excel_path)
-        messagebox.showinfo("Sukces", f"Oświadczenie dla {selected_client} zostało wypełnione i zapisane.")
-    else:
+    if not output_pdf_path:
         messagebox.showinfo("Anulowano", "Zapis PDF został anulowany.")
-        os.remove(filled_excel_path)
+        return
+    output_pdf_path = os.path.normpath(output_pdf_path)
+
+    busy = show_busy("Generowanie oświadczenia, proszę czekać...")
+
+    def on_done(result, error):
+        busy.destroy()
+        if error:
+            messagebox.showerror("Error", f"Nie udało się wyeksportować PDF: {error}")
+        elif messagebox.askyesno("Sukces", f"Oświadczenie dla {selected_client} zostało wypełnione i zapisane."
+                                           "\n\nOtworzyć plik?"):
+            os.startfile(output_pdf_path)
+
+    run_in_background(lambda: export_pdf(wb, print_area, output_pdf_path), on_done)
+
+# ------------------------- PDF Export and Flattening -------------------------
+A4_WIDTH_PX = 2480  # A4 width at 300 dpi
+
+def export_pdf(wb, print_area, output_pdf_path):
+    """Save the filled workbook as a PDF that looks scanned. Runs in a worker thread."""
+    # Working files go to a temporary folder, not to the folder the app was started from.
+    with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as temp_dir:
+        excel_path = os.path.join(temp_dir, "oswiadczenie.xlsx")
+        pdf_path = os.path.join(temp_dir, "oswiadczenie.pdf")
+        wb.save(excel_path)
+        excel_to_pdf(excel_path, pdf_path, print_area)
+        flatten_pdf(pdf_path, output_pdf_path)
+
+def excel_to_pdf(excel_path, pdf_path, print_area):
+    pythoncom.CoInitialize()
+    excel = win32.Dispatch("Excel.Application")
+    excel.Visible = False
+    excel.DisplayAlerts = False
+    wb_pdf = None
+    try:
+        wb_pdf = excel.Workbooks.Open(excel_path)
+        ws_pdf = wb_pdf.Worksheets(1)
+        # Set print area using Excel's COM interface
+        ws_pdf.PageSetup.PrintArea = print_area
+        ws_pdf.ExportAsFixedFormat(0, pdf_path)
+    finally:
+        if wb_pdf is not None:
+            wb_pdf.Close(False)
+        excel.Application.Quit()
+        pythoncom.CoUninitialize()
+
+def flatten_pdf(input_pdf_path, output_pdf_path):
+    # Convert each page into an image at A4 size (300 dpi) and rebuild the PDF from the images.
+    images = convert_from_path(input_pdf_path, size=(A4_WIDTH_PX, None))
+    a4_width, a4_height = A4  # A4 page dimensions in points (approx. 595x842)
+    c = canvas.Canvas(output_pdf_path, pagesize=A4)
+    for img in images:
+        img = add_scanned_effect(img)
+        width, height = img.size  # in pixels
+
+        # Calculate scale to fit image into A4 while preserving aspect ratio.
+        scale = min(a4_width / width, a4_height / height)
+        scaled_width = width * scale
+        scaled_height = height * scale
+
+        # Center the image on the A4 page.
+        x = (a4_width - scaled_width) / 2
+        y = (a4_height - scaled_height) / 2
+
+        # Embed the page as JPEG, like a scanner does: far smaller and faster than PNG.
+        page = io.BytesIO()
+        img.save(page, 'JPEG', quality=85)
+        page.seek(0)
+        c.drawImage(ImageReader(page), x, y, width=scaled_width, height=scaled_height)
+        c.showPage()
+    c.save()
 
 # ------------------------- Main Form Functions -------------------------
 def submit_form():
-    client_name = client_name_var.get()
-    year = year_var.get()
+    client_name = client_name_var.get().strip()
+    year = year_var.get().strip()
     audit_type = audit_type_var.get()
-    data_podpisu_umowy = data_podpisu_umowy_var.get()
-    data_podpisu_badania = data_podpisu_badania_var.get()
+    data_podpisu_umowy = data_podpisu_umowy_var.get().strip()
+    data_podpisu_badania = data_podpisu_badania_var.get().strip()
     if not client_name or not year or not audit_type or not data_podpisu_umowy:
         messagebox.showerror("Error", "Proszę wypełnić wszystkie pola.")
         return
+    # Use the spelling from the list even when the name was typed differently.
+    client_name = next((name for name in client_names
+                        if normalize_name(name) == normalize_name(client_name)), client_name)
     dzien_otw_bil = f"01.01.{year}"
     dzien_bil = f"31.12.{year}"
     if custom_dates_var.get():
-        dzien_otw_bil = dzien_otw_bil_var.get()
-        dzien_bil = dzien_bil_var.get()
-    open_signer_selection_dialog(client_name, dzien_otw_bil, dzien_bil, audit_type, data_podpisu_umowy, data_podpisu_badania)
+        dzien_otw_bil = dzien_otw_bil_var.get().strip()
+        dzien_bil = dzien_bil_var.get().strip()
+    elif not re.fullmatch(r"\d{4}", year):
+        messagebox.showerror("Error", "Nieprawidłowy rok badania.")
+        return
+
+    # Check every date now, before the signer selection, rather than at the very end.
+    dates_to_check = [("Data podpisu umowy", data_podpisu_umowy)]
+    if custom_dates_var.get():
+        dates_to_check += [("Dzień otwarcia bilansu", dzien_otw_bil), ("Dzień bilansowy", dzien_bil)]
+    if na_dzien_podpisu_var.get():
+        dates_to_check.append(("Data podpisu SzB", data_podpisu_badania))
+    invalid = [label for label, text in dates_to_check if parse_date(text) is None]
+    if invalid:
+        messagebox.showerror("Error", "Nieprawidłowy format daty (użyj formatu DD.MM.YYYY):\n" + "\n".join(invalid))
+        return
+    if parse_date(dzien_otw_bil) >= parse_date(dzien_bil):
+        messagebox.showerror("Error", "Dzień otwarcia bilansu musi być wcześniejszy niż dzień bilansowy.")
+        return
+
+    save_settings(signature_color=signature_color_var.get(), audit_type=audit_type)
+    open_signer_selection_dialog(client_name, dzien_otw_bil, dzien_bil, audit_type,
+                                 parse_date(data_podpisu_umowy), data_podpisu_badania)
 
 def toggle_custom_dates():
     state = tk.NORMAL if custom_dates_var.get() else tk.DISABLED
@@ -537,15 +596,16 @@ def toggle_data_podpisu():
     data_podpisu_badania_box.config(state=state)
 
 def on_client_name_entry(event):
-    value = client_name_var.get()
+    value = normalize_name(client_name_var.get())
     if len(value) < 3:
         client_name_combobox['values'] = []
     else:
-        data_list = [item for item in client_names if value.lower() in item.lower()]
+        data_list = [item for item in client_names if value in normalize_name(item)]
         client_name_combobox['values'] = data_list
         client_name_combobox.event_generate('<Down>')
 
 # ------------------------- Main GUI Setup -------------------------
+settings = load_settings()
 root = tk.Tk()
 root.title("Oświadczenia DAA")
 root.minsize(500, 500)
@@ -619,7 +679,7 @@ data_podpisu_umowy_box = ttk.Entry(client_frame, textvariable=data_podpisu_umowy
 data_podpisu_umowy_box.grid(row=5, column=1, padx=5, pady=5, sticky=(tk.W, tk.E))
 
 ttk.Label(client_frame, text="Badanie/Przegląd:").grid(row=6, column=0, padx=5, pady=5, sticky=tk.W)
-audit_type_var = tk.StringVar()
+audit_type_var = tk.StringVar(value=settings.get("audit_type", ""))
 audit_type_combobox = ttk.Combobox(client_frame, textvariable=audit_type_var)
 audit_type_combobox['values'] = [
     "badaniem ",
@@ -638,7 +698,7 @@ audit_type_combobox['values'] = [
 audit_type_combobox.grid(row=6, column=1, padx=5, pady=5, sticky=(tk.W, tk.E))
 
 ttk.Label(client_frame, text="Kolor podpisu:").grid(row=7, column=0, padx=5, pady=5, sticky=tk.W)
-signature_color_var = tk.StringVar(value="czarny")
+signature_color_var = tk.StringVar(value=settings.get("signature_color", "czarny"))
 signature_color_combobox = ttk.Combobox(client_frame, textvariable=signature_color_var)
 signature_color_combobox['values'] = ["czarny", "niebieski"]
 signature_color_combobox.grid(row=7, column=1, padx=5, pady=5, sticky=(tk.W, tk.E))

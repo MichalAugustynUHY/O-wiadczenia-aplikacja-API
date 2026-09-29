@@ -48,7 +48,6 @@ def find_app_folder():
         if base:
             candidates.append(os.path.join(base, APP_FOLDER_NAME))
 
-    # Pulpit (obejmuje też Pulpit przekierowany do OneDrive)
     candidates.append(os.path.join(desktop_path, APP_FOLDER_NAME))
 
     userprofile = os.environ.get("USERPROFILE")
@@ -460,7 +459,6 @@ def process_form(selected_client, display_client, dzien_otw_bil, dzien_bil, audi
     else:
         output_client_name = shorten_for_path(selected_client)
 
-    # e.g. "Oświadczenie_Firma S.A._jednostkowe_na dzień SzB.pdf"
     name_parts = [f'Oświadczenie_{output_client_name}', statement_scope(audit_type)]
     if skip_second_signature:
         name_parts.append('na dzień SzB')
@@ -522,9 +520,8 @@ def excel_to_pdf(excel_path, pdf_path, print_area):
         pythoncom.CoUninitialize()
 
 def flatten_pdf(input_pdf_path, output_pdf_path):
-    # Convert each page into an image at A4 size (300 dpi) and rebuild the PDF from the images.
     images = convert_from_path(input_pdf_path, size=(A4_WIDTH_PX, None))
-    a4_width, a4_height = A4  # A4 page dimensions in points (approx. 595x842)
+    a4_width, a4_height = A4
     c = canvas.Canvas(output_pdf_path, pagesize=A4)
     for img in images:
         img = add_scanned_effect(img)

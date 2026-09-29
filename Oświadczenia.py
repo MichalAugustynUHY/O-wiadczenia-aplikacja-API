@@ -48,30 +48,25 @@ def find_app_folder():
         if base:
             candidates.append(os.path.join(base, APP_FOLDER_NAME))
 
-    # 2) Pulpit (obejmuje też Pulpit przekierowany do OneDrive)
+    # Pulpit (obejmuje też Pulpit przekierowany do OneDrive)
     candidates.append(os.path.join(desktop_path, APP_FOLDER_NAME))
 
-    # 3) Katalog profilu użytkownika
     userprofile = os.environ.get("USERPROFILE")
     if userprofile:
         candidates.append(os.path.join(userprofile, APP_FOLDER_NAME))
 
-    # Zwróć pierwszą lokalizację, która realnie istnieje
     for path in candidates:
         if os.path.isdir(path):
             print("Znaleziono folder aplikacji:", path)
             return path
 
-    # Nic nie znaleziono – zwróć najlepsze przypuszczenie (pierwsze z listy)
     fallback = candidates[0] if candidates else os.path.join(desktop_path, APP_FOLDER_NAME)
     print("UWAGA: nie znaleziono folderu aplikacji. Używam:", fallback)
     return fallback
 
 base_dir = find_app_folder()
 
-# Signatures folder (client data comes from SharePoint, see sharepoint_sync.py)
 signature_dir = os.path.join(base_dir, "podpisy")
-# Last used choices, remembered per user
 settings_path = os.path.join(sharepoint_sync.DATA_DIR, "ustawienia.json")
 
 # ------------------------- Background Work -------------------------
@@ -225,16 +220,12 @@ def parse_date(text):
 
 # ------------------------- Scanned Effect Function -------------------------
 def add_scanned_effect(img):
-    # Slight random rotation
     angle = np.random.uniform(-0.5, 0.4)
     img = img.rotate(angle, expand=1, fillcolor=(255,255,255))
-    # Add slight blur
     img = img.filter(ImageFilter.GaussianBlur(radius=0.7))
-    # Add noise
     arr = np.asarray(img, dtype=np.int16)
     arr += np.random.default_rng().normal(0, 8, arr.shape).astype(np.int16)
     img = Image.fromarray(np.clip(arr, 0, 255).astype(np.uint8))
-    # Adjust contrast and brightness
     enhancer = ImageEnhance.Contrast(img)
     img = enhancer.enhance(1.15)
     enhancer = ImageEnhance.Brightness(img)
@@ -297,11 +288,9 @@ def open_signer_selection_dialog(client_name, client_entries, dzien_otw_bil, dzi
     sel_dialog.title("Wybór daty i podpisujących")
     sel_dialog.geometry("800x800")
 
-    # Table frame
     table_frame = ttk.LabelFrame(sel_dialog, text="Rekordy klienta", padding="10")
     table_frame.pack(fill=tk.BOTH, expand=True, padx=10, pady=10)
 
-    # Create Treeview with scrollbars
     tree_frame = ttk.Frame(table_frame)
     tree_frame.pack(fill=tk.BOTH, expand=True)
     vsb = ttk.Scrollbar(tree_frame, orient="vertical")
@@ -311,7 +300,7 @@ def open_signer_selection_dialog(client_name, client_entries, dzien_otw_bil, dzi
     columns = ("Data rozpoczęcia", "Osoba odpowiedzialna", "Typ zadania", "Rodzaj sprawozdania")
     consolidated = len(client_entries) > 1
     if consolidated:
-        columns += ("Nazwa firmy",)  # which of the consolidated entries a record comes from
+        columns += ("Nazwa firmy",)
     tree = ttk.Treeview(tree_frame, columns=columns, show="headings",
                         yscrollcommand=vsb.set, xscrollcommand=hsb.set)
     for col in columns:
@@ -324,8 +313,7 @@ def open_signer_selection_dialog(client_name, client_entries, dzien_otw_bil, dzi
     client_records['Data rozpoczęcia'] = pd.to_datetime(client_records['Data rozpoczęcia'], errors='coerce')
     client_records = client_records.sort_values(by='Data rozpoczęcia')
 
-    # Insert records, remembering each row's date (the shown DD.MM.YYYY text is not parsed back)
-    row_dates = {}
+    row_dates = {}  # the shown DD.MM.YYYY text is not parsed back
     for idx, row in client_records.iterrows():
         start = row['Data rozpoczęcia']
         date_str = start.strftime("%d.%m.%Y") if pd.notnull(start) else ''
@@ -335,7 +323,6 @@ def open_signer_selection_dialog(client_name, client_entries, dzien_otw_bil, dzi
         item = tree.insert("", "end", values=values)
         row_dates[item] = start
 
-    # Options frame
     options_frame = ttk.LabelFrame(sel_dialog, text="Wybór osób podpisujących i daty", padding="10")
     options_frame.pack(fill=tk.X, padx=10, pady=10)
     ttk.Label(options_frame, text="Osoby podpisujące:").grid(row=0, column=0, sticky=tk.W)
@@ -359,7 +346,6 @@ def open_signer_selection_dialog(client_name, client_entries, dzien_otw_bil, dzi
         custom_date_entry = ttk.Entry(options_frame, textvariable=custom_date_var, width=15)
     custom_date_entry.grid(row=2, column=1, sticky=tk.W, padx=5, pady=5)
 
-    # New frame for client name override
     override_frame = ttk.Frame(options_frame)
     override_frame.grid(row=3, column=0, columnspan=2, sticky=tk.W, padx=5, pady=5)
     ttk.Label(override_frame, text="Zmień nazwę klienta (opcjonalnie):").grid(row=0, column=0, sticky=tk.W)
@@ -375,15 +361,12 @@ def open_signer_selection_dialog(client_name, client_entries, dzien_otw_bil, dzi
             custom_date_var.set('')
             return
         custom_date_var.set(start.strftime("%d.%m.%Y"))
-        # Check the signers having a task (other than "Oświadczenie") on or after the selected day
-        # and uncheck the others
         selected_date = start.normalize()
         for signer, var in signer_vars.items():
             if signer not in missing_signature:
                 var.set(int(any(task['appearance_date'] >= selected_date for task in signer_tasks[signer])))
     tree.bind("<<TreeviewSelect>>", on_tree_select)
 
-    # OK and Cancel buttons
     def on_ok():
         selected_signers = [signer for signer, var in signer_vars.items() if var.get() == 1]
         if not selected_signers:
@@ -396,9 +379,7 @@ def open_signer_selection_dialog(client_name, client_entries, dzien_otw_bil, dzi
                                  parent=sel_dialog)
             return
         sel_dialog.destroy()
-        # Read the override client name for display only.
         display_client_name = client_name_override_var.get().strip()
-        # Pass the original client name (for filtering) and the override (for display)
         process_form(client_name, display_client_name, dzien_otw_bil, dzien_bil, audit_type,
                      data_podpisu_umowy, data_podpisu_badania, selected_signers, signature_color, contact_date)
     def on_cancel():
@@ -438,7 +419,6 @@ def process_form(selected_client, display_client, dzien_otw_bil, dzien_bil, audi
     wb = openpyxl.load_workbook(template_path)
     ws = wb.active
 
-    # Write the client name to Excel – use display_client if provided, otherwise the original
     final_client_name = display_client if display_client else selected_client
     if grupa_kapitalowa_var.get():
         ws[name_cell] = "Grupa kapitałowa " + final_client_name
@@ -472,7 +452,6 @@ def process_form(selected_client, display_client, dzien_otw_bil, dzien_bil, audi
         if row[0].value is None:
             ws.row_dimensions[row[0].row].hidden = True
 
-    # Print area of "Szablon dzien podpisu.xlsx" / "Szablon.xlsx"
     print_area = 'A1:J32' if skip_second_signature else 'A1:I31'
     ws.print_area = print_area
 
@@ -487,11 +466,9 @@ def process_form(selected_client, display_client, dzien_otw_bil, dzien_bil, audi
         name_parts.append('na dzień SzB')
     initial_name = '_'.join(part for part in name_parts if part) + '.pdf'
 
-    # Create the folder only once if it does not exist.
     folder_path = os.path.join(desktop_path, safe_filename(f"Oświadczenia_{shorten_for_path(selected_client)}"))
     os.makedirs(folder_path, exist_ok=True)
 
-    # Set the default directory for the save dialog to folder_path.
     output_pdf_path = asksaveasfilename(
         defaultextension=".pdf",
         filetypes=[("PDF files", "*.pdf")],
@@ -520,7 +497,6 @@ A4_WIDTH_PX = 2480  # A4 width at 300 dpi
 
 def export_pdf(wb, print_area, output_pdf_path):
     """Save the filled workbook as a PDF that looks scanned. Runs in a worker thread."""
-    # Working files go to a temporary folder, not to the folder the app was started from.
     with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as temp_dir:
         excel_path = os.path.join(temp_dir, "oswiadczenie.xlsx")
         pdf_path = os.path.join(temp_dir, "oswiadczenie.pdf")
@@ -537,7 +513,6 @@ def excel_to_pdf(excel_path, pdf_path, print_area):
     try:
         wb_pdf = excel.Workbooks.Open(excel_path)
         ws_pdf = wb_pdf.Worksheets(1)
-        # Set print area using Excel's COM interface
         ws_pdf.PageSetup.PrintArea = print_area
         ws_pdf.ExportAsFixedFormat(0, pdf_path)
     finally:
@@ -555,12 +530,9 @@ def flatten_pdf(input_pdf_path, output_pdf_path):
         img = add_scanned_effect(img)
         width, height = img.size  # in pixels
 
-        # Calculate scale to fit image into A4 while preserving aspect ratio.
         scale = min(a4_width / width, a4_height / height)
         scaled_width = width * scale
         scaled_height = height * scale
-
-        # Center the image on the A4 page.
         x = (a4_width - scaled_width) / 2
         y = (a4_height - scaled_height) / 2
 
@@ -729,7 +701,6 @@ root = tk.Tk()
 root.title("Oświadczenia DAA")
 root.minsize(500, 500)
 
-# Apply ttk styles for a modern look
 style = ttk.Style(root)
 style.theme_use('clam')
 style.configure('TLabel', font=('Calibri', 11), padding=5)

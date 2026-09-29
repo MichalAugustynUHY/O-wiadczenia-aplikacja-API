@@ -145,9 +145,9 @@ def load_data():
                            spellings.drop_duplicates('client_key')['Nazwa firmy']), key=str.casefold)
     client_name_combobox['values'] = client_names
 
-def client_rows(client_name):
-    """All rows of a client, whichever spelling of the name they use."""
-    return data[data['client_key'] == normalize_name(client_name)]
+def client_rows(client_entries):
+    """All rows of the given client entries, whichever spelling of the name they use."""
+    return data[data['client_key'].isin({normalize_name(name) for name in client_entries})]
 
 def show_data_status(note=""):
     if data_synced_at:
@@ -199,6 +199,23 @@ def safe_filename(name):
     """The name with the characters Windows does not allow in file and folder names replaced."""
     return re.sub(r'[<>:/\\|?*\x00-\x1f]', '_', name.replace('"', "'")).strip()
 
+def shorten_for_path(name, limit=60):
+    """Client name cut to at most `limit` characters for folder and file names, so that the
+    full path stays under Windows' 260-character limit. The statement keeps the full name."""
+    if len(name) <= limit:
+        return name
+    cut = name[:limit]
+    if name[limit] != " " and " " in cut:
+        cut = cut.rsplit(" ", 1)[0]  # do not cut a word in half
+    return cut.rstrip(" ,.-")
+
+def statement_scope(audit_type):
+    """'jednostkowe', 'skonsolidowane' or both, depending on the selected statement type."""
+    text = audit_type.lower()
+    scopes = [scope for stem, scope in (("jednostkow", "jednostkowe"), ("skonsolidowan", "skonsolidowane"))
+              if stem in text]
+    return " i ".join(scopes)
+
 def parse_date(text):
     """Date from DD.MM.YYYY text, or None when the text is not such a date."""
     try:
@@ -228,9 +245,9 @@ def add_scanned_effect(img):
 def normalize_task_type(value):
     return str(value).strip().lower() if pd.notnull(value) else ''
 
-def get_client_records(client_name):
+def get_client_records(client_entries):
     records = []
-    for _, row in client_rows(client_name).iterrows():
+    for _, row in client_rows(client_entries).iterrows():
         records.append({
             'signer_name': row['Osoba odpowiedzialna'],
             'task_type': row['Typ zadania'],
@@ -248,13 +265,15 @@ def compute_earliest_date(signer_data_list, client_name):
     return min(dates)
 
 # ------------------------- Signer Selection Dialog -------------------------
-def open_signer_selection_dialog(client_name, dzien_otw_bil, dzien_bil, audit_type, data_podpisu_umowy, data_podpisu_badania):
-    client_records = client_rows(client_name).copy()
+def open_signer_selection_dialog(client_name, client_entries, dzien_otw_bil, dzien_bil, audit_type,
+                                 data_podpisu_umowy, data_podpisu_badania):
+    """client_entries: the client's entries in the list - just client_name, or several consolidated ones."""
+    client_records = client_rows(client_entries).copy()
     if client_records.empty:
         messagebox.showerror("Error", f"Nie znaleziono danych dla klienta: {client_name}")
         return
 
-    signer_data_list = get_client_records(client_name)
+    signer_data_list = get_client_records(client_entries)
 
     computed_earliest_date = compute_earliest_date(signer_data_list, client_name)
     if computed_earliest_date is None:
@@ -290,6 +309,9 @@ def open_signer_selection_dialog(client_name, dzien_otw_bil, dzien_bil, audit_ty
     hsb = ttk.Scrollbar(tree_frame, orient="horizontal")
     hsb.pack(side="bottom", fill="x")
     columns = ("Data rozpoczęcia", "Osoba odpowiedzialna", "Typ zadania", "Rodzaj sprawozdania")
+    consolidated = len(client_entries) > 1
+    if consolidated:
+        columns += ("Nazwa firmy",)  # which of the consolidated entries a record comes from
     tree = ttk.Treeview(tree_frame, columns=columns, show="headings",
                         yscrollcommand=vsb.set, xscrollcommand=hsb.set)
     for col in columns:
@@ -307,7 +329,10 @@ def open_signer_selection_dialog(client_name, dzien_otw_bil, dzien_bil, audit_ty
     for idx, row in client_records.iterrows():
         start = row['Data rozpoczęcia']
         date_str = start.strftime("%d.%m.%Y") if pd.notnull(start) else ''
-        item = tree.insert("", "end", values=(date_str, row['Osoba odpowiedzialna'], row['Typ zadania'], row['Rodzaj sprawozdania']))
+        values = [date_str, row['Osoba odpowiedzialna'], row['Typ zadania'], row['Rodzaj sprawozdania']]
+        if consolidated:
+            values.append(row['Nazwa firmy'])
+        item = tree.insert("", "end", values=values)
         row_dates[item] = start
 
     # Options frame
@@ -452,17 +477,18 @@ def process_form(selected_client, display_client, dzien_otw_bil, dzien_bil, audi
     ws.print_area = print_area
 
     if grupa_kapitalowa_var.get():
-        output_client_name = "Grupa kapitałowa " + selected_client
+        output_client_name = "Grupa kapitałowa " + shorten_for_path(selected_client)
     else:
-        output_client_name = selected_client
+        output_client_name = shorten_for_path(selected_client)
 
+    # e.g. "Oświadczenie_Firma S.A._jednostkowe_na dzień SzB.pdf"
+    name_parts = [f'Oświadczenie_{output_client_name}', statement_scope(audit_type)]
     if skip_second_signature:
-        initial_name = f'Oświadczenie_{output_client_name}_na dzień SzB.pdf'
-    else:
-        initial_name = f'Oświadczenie_{output_client_name}.pdf'
+        name_parts.append('na dzień SzB')
+    initial_name = '_'.join(part for part in name_parts if part) + '.pdf'
 
     # Create the folder only once if it does not exist.
-    folder_path = os.path.join(desktop_path, safe_filename(f"Oświadczenia_{selected_client}"))
+    folder_path = os.path.join(desktop_path, safe_filename(f"Oświadczenia_{shorten_for_path(selected_client)}"))
     os.makedirs(folder_path, exist_ok=True)
 
     # Set the default directory for the save dialog to folder_path.
@@ -583,8 +609,101 @@ def submit_form():
         return
 
     save_settings(signature_color=signature_color_var.get(), audit_type=audit_type)
-    open_signer_selection_dialog(client_name, dzien_otw_bil, dzien_bil, audit_type,
+    client_entries = merged_clients if merged_clients else [client_name]
+    open_signer_selection_dialog(client_name, client_entries, dzien_otw_bil, dzien_bil, audit_type,
                                  parse_date(data_podpisu_umowy), data_podpisu_badania)
+
+# ------------------------- Consolidating Client Entries -------------------------
+# Several entries of the list that are the same client (e.g. an old and a new name), treated as
+# one client. The first one is the main entry: its name goes on the statement and in the file name.
+merged_clients = []
+
+def toggle_consolidate():
+    if consolidate_var.get():
+        open_consolidation_dialog()
+    else:
+        set_merged_clients([])
+
+def set_merged_clients(names):
+    merged_clients[:] = names
+    if names:
+        client_name_var.set(names[0])
+        client_name_combobox.config(state=tk.DISABLED)  # untick "Połącz wpisy" to change the client
+        merged_label.config(text=f"Połączone wpisy ({len(names)}): " + "; ".join(names))
+        merged_label.grid()
+    else:
+        consolidate_var.set(0)
+        client_name_combobox.config(state=tk.NORMAL)
+        merged_label.grid_remove()
+
+def open_consolidation_dialog():
+    current = normalize_name(client_name_var.get())
+    chosen = [name for name in client_names if normalize_name(name) == current]  # in the order picked
+    shown = []
+
+    dialog = tk.Toplevel(root)
+    dialog.title("Połącz wpisy klienta")
+    dialog.transient(root)
+    ttk.Label(dialog, text="Zaznacz wpisy dotyczące tego samego klienta (kliknięcie zaznacza lub odznacza):"
+              ).pack(anchor=tk.W, padx=10, pady=(10, 0))
+    search_var = tk.StringVar()
+    search_entry = ttk.Entry(dialog, textvariable=search_var)
+    search_entry.pack(fill=tk.X, padx=10, pady=5)
+    list_frame = ttk.Frame(dialog)
+    list_frame.pack(fill=tk.BOTH, expand=True, padx=10)
+    listbox = tk.Listbox(list_frame, selectmode=tk.MULTIPLE, exportselection=False,
+                         width=80, height=15, font=('Calibri', 11))
+    scrollbar = ttk.Scrollbar(list_frame, orient="vertical", command=listbox.yview)
+    listbox.config(yscrollcommand=scrollbar.set)
+    listbox.pack(side="left", fill=tk.BOTH, expand=True)
+    scrollbar.pack(side="right", fill="y")
+    chosen_label = ttk.Label(dialog, wraplength=600)
+    chosen_label.pack(anchor=tk.W, padx=10, pady=5)
+
+    def show_chosen():
+        chosen_label.config(text=f"Wybrane ({len(chosen)}): " + "; ".join(chosen))
+
+    def filter_list(*_):
+        value = normalize_name(search_var.get())
+        shown[:] = [name for name in client_names if value in normalize_name(name)]
+        listbox.delete(0, tk.END)
+        for i, name in enumerate(shown):
+            listbox.insert(tk.END, name)
+            if name in chosen:
+                listbox.selection_set(i)
+                listbox.see(i)
+
+    def on_select(event):
+        selected = set(listbox.curselection())
+        for i, name in enumerate(shown):
+            if i in selected and name not in chosen:
+                chosen.append(name)
+            elif i not in selected and name in chosen:
+                chosen.remove(name)
+        show_chosen()
+
+    def on_ok():
+        if len(chosen) < 2:
+            messagebox.showerror("Error", "Wybierz co najmniej dwa wpisy klienta.", parent=dialog)
+            return
+        dialog.destroy()
+        set_merged_clients(chosen)
+
+    def on_cancel():
+        dialog.destroy()
+        set_merged_clients([])
+
+    search_var.trace_add("write", filter_list)
+    listbox.bind("<<ListboxSelect>>", on_select)
+    dialog.protocol("WM_DELETE_WINDOW", on_cancel)
+    btn_frame = ttk.Frame(dialog)
+    btn_frame.pack(pady=10)
+    ttk.Button(btn_frame, text="OK", command=on_ok).grid(row=0, column=0, padx=10)
+    ttk.Button(btn_frame, text="Anuluj", command=on_cancel).grid(row=0, column=1, padx=10)
+    filter_list()
+    show_chosen()
+    search_entry.focus_set()
+    dialog.grab_set()
 
 def toggle_custom_dates():
     state = tk.NORMAL if custom_dates_var.get() else tk.DISABLED
@@ -640,12 +759,22 @@ separator.grid(row=2, column=0, columnspan=2, sticky='ew', pady=10)
 client_frame = ttk.LabelFrame(main_frame, text="Dane oświadczenia")
 client_frame.grid(row=3, column=0, columnspan=2, sticky=(tk.W, tk.E), pady=10)
 
-ttk.Label(client_frame, text="Wybierz klienta:").grid(row=0, column=0, padx=5, pady=5, sticky=tk.W)
+ttk.Label(client_frame, text="Wybierz klienta:").grid(row=0, column=0, padx=5, pady=5, sticky=(tk.N, tk.W))
+client_entry_frame = ttk.Frame(client_frame)
+client_entry_frame.grid(row=0, column=1, padx=5, pady=5, sticky=(tk.W, tk.E))
+client_entry_frame.columnconfigure(0, weight=1)
 client_name_var = tk.StringVar()
-client_name_combobox = ttk.Combobox(client_frame, textvariable=client_name_var)
+client_name_combobox = ttk.Combobox(client_entry_frame, textvariable=client_name_var)
 client_name_combobox['values'] = []
-client_name_combobox.grid(row=0, column=1, padx=5, pady=5, sticky=(tk.W, tk.E))
+client_name_combobox.grid(row=0, column=0, sticky=(tk.W, tk.E))
 client_name_combobox.bind('<KeyRelease>', on_client_name_entry)
+consolidate_var = tk.IntVar()
+consolidate_checkbutton = ttk.Checkbutton(client_entry_frame, text="Połącz wpisy", variable=consolidate_var,
+                                          command=toggle_consolidate)
+consolidate_checkbutton.grid(row=0, column=1, padx=(10, 0))
+merged_label = ttk.Label(client_entry_frame, foreground="gray", wraplength=400)
+merged_label.grid(row=1, column=0, columnspan=2, sticky=tk.W)
+merged_label.grid_remove()  # shown only while entries are consolidated
 client_frame.columnconfigure(1, weight=1)
 
 ttk.Label(client_frame, text="Rok badania:").grid(row=1, column=0, padx=5, pady=5, sticky=tk.W)

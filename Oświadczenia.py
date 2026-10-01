@@ -9,7 +9,7 @@ from collections import defaultdict
 import tkinter as tk
 from tkinter import ttk, messagebox
 from tkinter.filedialog import asksaveasfilename
-from datetime import datetime
+from datetime import date, datetime
 import threading
 import pythoncom
 import numpy as np
@@ -210,12 +210,50 @@ def statement_scope(audit_type):
               if stem in text]
     return " i ".join(scopes)
 
+WINDOW_FRAME = 40  # title bar and borders around a window's content
+
+def work_area():
+    """Usable part of the main screen, i.e. without the taskbar: (left, top, right, bottom)."""
+    rect = wintypes.RECT()
+    windll.user32.SystemParametersInfoW(0x0030, 0, ctypes.byref(rect), 0)  # SPI_GETWORKAREA
+    return rect.left, rect.top, rect.right, rect.bottom
+
+def center_on_screen(window, width=None, height=None):
+    """Centre the window in the usable screen area. With a size given, the window gets that size,
+    shrunk if needed to fit the screen; without it, it keeps sizing itself to its content."""
+    window.update_idletasks()
+    left, top, right, bottom = work_area()
+    if width and height:
+        width = min(width, right - left - WINDOW_FRAME)
+        height = min(height, bottom - top - WINDOW_FRAME)
+        size = f"{width}x{height}"
+    else:
+        width = max(window.winfo_reqwidth(), window.minsize()[0])
+        height = max(window.winfo_reqheight(), window.minsize()[1])
+        size = ""
+    x = left + max(0, (right - left - width - WINDOW_FRAME) // 2)
+    y = top + max(0, (bottom - top - height - WINDOW_FRAME) // 2)
+    window.geometry(f"{size}+{x}+{y}")
+
 def parse_date(text):
-    """Date from DD.MM.YYYY text, or None when the text is not such a date."""
+    """Date typed as DD.MM.YYYY - also D.M.YY, with "-" or "/" instead of dots, or as YYYY-MM-DD.
+    None when the text is not a valid date."""
+    text = text.strip()
+    match = re.fullmatch(r"(\d{1,2})[./-](\d{1,2})[./-](\d{4}|\d{2})", text)
+    if match:
+        day, month, year = match.groups()
+    else:
+        match = re.fullmatch(r"(\d{4})-(\d{1,2})-(\d{1,2})", text)
+        if not match:
+            return None
+        year, month, day = match.groups()
     try:
-        return datetime.strptime(text.strip(), '%d.%m.%Y').date()
+        return date(int(year) + (2000 if len(year) == 2 else 0), int(month), int(day))
     except ValueError:
         return None
+
+def format_date(value):
+    return value.strftime("%d.%m.%Y")
 
 # ------------------------- Scanned Effect Function -------------------------
 def add_scanned_effect(img):
@@ -285,7 +323,6 @@ def open_signer_selection_dialog(client_name, client_entries, dzien_otw_bil, dzi
 
     sel_dialog = tk.Toplevel(root)
     sel_dialog.title("Wybór daty i podpisujących")
-    sel_dialog.geometry("800x800")
 
     table_frame = ttk.LabelFrame(sel_dialog, text="Rekordy klienta", padding="10")
     table_frame.pack(fill=tk.BOTH, expand=True, padx=10, pady=10)
@@ -387,6 +424,10 @@ def open_signer_selection_dialog(client_name, client_entries, dzien_otw_bil, dzi
     btn_frame.pack(pady=10)
     ttk.Button(btn_frame, text="OK", command=on_ok).grid(row=0, column=0, padx=10)
     ttk.Button(btn_frame, text="Anuluj", command=on_cancel).grid(row=0, column=1, padx=10)
+
+    center_on_screen(sel_dialog, 800, 800)
+    if tree.get_children():
+        tree.see(tree.get_children()[-1])  # show the latest records
 
 # ------------------------- Process Form -------------------------
 def process_form(selected_client, display_client, dzien_otw_bil, dzien_bil, audit_type,
@@ -544,29 +585,21 @@ def flatten_pdf(input_pdf_path, output_pdf_path):
 # ------------------------- Main Form Functions -------------------------
 def submit_form():
     client_name = client_name_var.get().strip()
-    year = year_var.get().strip()
     audit_type = audit_type_var.get()
+    dzien_otw_bil = dzien_otw_bil_var.get().strip()
+    dzien_bil = dzien_bil_var.get().strip()
     data_podpisu_umowy = data_podpisu_umowy_var.get().strip()
     data_podpisu_badania = data_podpisu_badania_var.get().strip()
-    if not client_name or not year or not audit_type or not data_podpisu_umowy:
+    if not client_name or not dzien_otw_bil or not dzien_bil or not audit_type or not data_podpisu_umowy:
         messagebox.showerror("Error", "Proszę wypełnić wszystkie pola.")
         return
     # Use the spelling from the list even when the name was typed differently.
     client_name = next((name for name in client_names
                         if normalize_name(name) == normalize_name(client_name)), client_name)
-    dzien_otw_bil = f"01.01.{year}"
-    dzien_bil = f"31.12.{year}"
-    if custom_dates_var.get():
-        dzien_otw_bil = dzien_otw_bil_var.get().strip()
-        dzien_bil = dzien_bil_var.get().strip()
-    elif not re.fullmatch(r"\d{4}", year):
-        messagebox.showerror("Error", "Nieprawidłowy rok badania.")
-        return
 
     # Check every date now, before the signer selection, rather than at the very end.
-    dates_to_check = [("Data podpisu umowy", data_podpisu_umowy)]
-    if custom_dates_var.get():
-        dates_to_check += [("Dzień otwarcia bilansu", dzien_otw_bil), ("Dzień bilansowy", dzien_bil)]
+    dates_to_check = [("Od (dzień otwarcia bilansu)", dzien_otw_bil), ("Do (dzień bilansowy)", dzien_bil),
+                      ("Data podpisu umowy", data_podpisu_umowy)]
     if na_dzien_podpisu_var.get():
         dates_to_check.append(("Data podpisu SzB", data_podpisu_badania))
     invalid = [label for label, text in dates_to_check if parse_date(text) is None]
@@ -576,6 +609,10 @@ def submit_form():
     if parse_date(dzien_otw_bil) >= parse_date(dzien_bil):
         messagebox.showerror("Error", "Dzień otwarcia bilansu musi być wcześniejszy niż dzień bilansowy.")
         return
+    dzien_otw_bil = format_date(parse_date(dzien_otw_bil))
+    dzien_bil = format_date(parse_date(dzien_bil))
+    if na_dzien_podpisu_var.get():
+        data_podpisu_badania = format_date(parse_date(data_podpisu_badania))
 
     save_settings(signature_color=signature_color_var.get(), audit_type=audit_type)
     client_entries = merged_clients if merged_clients else [client_name]
@@ -671,13 +708,64 @@ def open_consolidation_dialog():
     ttk.Button(btn_frame, text="Anuluj", command=on_cancel).grid(row=0, column=1, padx=10)
     filter_list()
     show_chosen()
+    center_on_screen(dialog)
     search_entry.focus_set()
     dialog.grab_set()
 
-def toggle_custom_dates():
-    state = tk.NORMAL if custom_dates_var.get() else tk.DISABLED
-    dzien_otw_bil_box.config(state=state)
-    dzien_bil_box.config(state=state)
+# ------------------------- Reporting Period -------------------------
+auto_period = None   # (od, do) last filled in from the year
+applied_year = None
+
+def set_year(year):
+    year_var.set(str(year))
+    apply_year(force=True)
+
+def apply_year(force=False):
+    """Fill Od/Do from the year: 01.01-30.06 for a review (Przegląd), the whole year for an audit (Badanie).
+    Only the user's own actions call this (choosing a year, the buttons); leaving the year field
+    without changing the year keeps dates typed by hand."""
+    global auto_period, applied_year
+    text = year_var.get().strip()
+    if not text:
+        return
+    if not re.fullmatch(r"\d{4}", text):
+        period_label.configure(text="Nieprawidłowy rok obrotowy.", style="Blad.TLabel")
+        return
+    year = int(text)
+    if not force and year == applied_year:
+        return
+    applied_year = year
+    end = "30.06" if period_kind_var.get() == "przegląd" else "31.12"
+    auto_period = (f"01.01.{year}", f"{end}.{year}")
+    dzien_otw_bil_var.set(auto_period[0])
+    dzien_bil_var.set(auto_period[1])
+
+def normalize_date_entry(var):
+    parsed = parse_date(var.get())
+    if parsed and format_date(parsed) != var.get():
+        var.set(format_date(parsed))
+
+def on_period_change(*_):
+    manual = (dzien_otw_bil_var.get(), dzien_bil_var.get()) != auto_period
+    start, end = parse_date(dzien_otw_bil_var.get()), parse_date(dzien_bil_var.get())
+    if start is None or end is None:
+        field = "Od" if start is None else "Do"
+        period_label.configure(text=f"Nieprawidłowa data „{field}” – wpisz DD.MM.RRRR.", style="Blad.TLabel")
+    elif start >= end:
+        period_label.configure(text="Data „Od” musi być wcześniejsza niż „Do”.", style="Blad.TLabel")
+    else:
+        if manual:
+            description = "Okres ustawiony ręcznie"
+        elif period_kind_var.get() == "przegląd":
+            description = f"Przegląd – I półrocze {applied_year}"
+        else:
+            description = f"Pełny rok obrotowy {applied_year}"
+        period_label.configure(text=f"{description}: {(end - start).days + 1} dni.",
+                               style="Podpowiedz.TLabel" if manual else "OK.TLabel")
+    if manual:
+        restore_button.grid()
+    else:
+        restore_button.grid_remove()
 
 def toggle_data_podpisu():
     state = tk.NORMAL if na_dzien_podpisu_var.get() else tk.DISABLED
@@ -706,6 +794,11 @@ style.configure('TEntry', font=('Calibri', 11))
 style.configure('TCombobox', font=('Calibri', 11))
 style.configure('TLabelframe', font=('Calibri', 11, 'bold'), padding=10)
 style.configure('TLabelframe.Label', font=('Calibri', 12, 'bold'))
+style.configure('Toolbutton', font=('Calibri', 11), padding=5, relief='raised', anchor='center')
+style.map('Toolbutton', relief=[('selected', 'sunken')], background=[('selected', '#c5d9ee'), ('active', '#e8e6e1')])
+style.configure('Podpowiedz.TLabel', foreground='#666666')
+style.configure('Blad.TLabel', foreground='#b00020')
+style.configure('OK.TLabel', foreground='#1b7a2f')
 
 main_frame = ttk.Frame(root, padding="15")
 main_frame.grid(row=0, column=0, sticky=(tk.N, tk.S, tk.E, tk.W))
@@ -745,30 +838,37 @@ merged_label.grid(row=1, column=0, columnspan=2, sticky=tk.W)
 merged_label.grid_remove()  # shown only while entries are consolidated
 client_frame.columnconfigure(1, weight=1)
 
-ttk.Label(client_frame, text="Rok badania:").grid(row=1, column=0, padx=5, pady=5, sticky=tk.W)
+ttk.Label(client_frame, text="Rok obrotowy:").grid(row=1, column=0, padx=5, pady=5, sticky=tk.W)
+year_frame = ttk.Frame(client_frame)
+year_frame.grid(row=1, column=1, padx=5, pady=5, sticky=tk.W)
 year_var = tk.StringVar()
-year_combobox = ttk.Combobox(client_frame, textvariable=year_var)
-year_combobox['values'] = [str(y) for y in range(2021, datetime.now().year + 1)]
-year_combobox.grid(row=1, column=1, padx=5, pady=5, sticky=(tk.W, tk.E))
+year_combobox = ttk.Combobox(year_frame, textvariable=year_var, width=7,
+                             values=[str(y) for y in range(2021, datetime.now().year + 1)])
+year_combobox.grid(row=0, column=0, sticky=tk.W)
+year_combobox.bind("<<ComboboxSelected>>", lambda e: apply_year(force=True))
+year_combobox.bind("<Return>", lambda e: apply_year(force=True))
+year_combobox.bind("<FocusOut>", lambda e: apply_year())
+period_kind_var = tk.StringVar(value="badanie")
+ttk.Radiobutton(year_frame, text="Przegląd", value="przegląd", variable=period_kind_var, style="Toolbutton",
+                width=9, command=lambda: apply_year(force=True)).grid(row=0, column=1, padx=(6, 0))
+ttk.Radiobutton(year_frame, text="Badanie", value="badanie", variable=period_kind_var, style="Toolbutton",
+                width=9, command=lambda: apply_year(force=True)).grid(row=0, column=2, padx=(4, 0))
 
-custom_dates_var = tk.IntVar()
-custom_dates_checkbutton = ttk.Checkbutton(
-    client_frame, 
-    text="Przesunięty rok obrotowy", 
-    variable=custom_dates_var, 
-    command=toggle_custom_dates
-)
-custom_dates_checkbutton.grid(row=2, column=0, columnspan=2, padx=5, pady=5, sticky=tk.W)
-
-ttk.Label(client_frame, text="Dzień otwarcia bilansu:").grid(row=3, column=0, padx=5, pady=5, sticky=tk.W)
-dzien_otw_bil_var = tk.StringVar(value="01.01.2021")
-dzien_otw_bil_box = ttk.Entry(client_frame, textvariable=dzien_otw_bil_var, state=tk.DISABLED)
-dzien_otw_bil_box.grid(row=3, column=1, padx=5, pady=5, sticky=(tk.W, tk.E))
-
-ttk.Label(client_frame, text="Dzień bilansowy:").grid(row=4, column=0, padx=5, pady=5, sticky=tk.W)
-dzien_bil_var = tk.StringVar(value="31.12.2021")
-dzien_bil_box = ttk.Entry(client_frame, textvariable=dzien_bil_var, state=tk.DISABLED)
-dzien_bil_box.grid(row=4, column=1, padx=5, pady=5, sticky=(tk.W, tk.E))
+ttk.Label(client_frame, text="Okres:").grid(row=2, column=0, padx=5, pady=5, sticky=tk.W)
+period_frame = ttk.Frame(client_frame)
+period_frame.grid(row=2, column=1, padx=5, pady=5, sticky=tk.W)
+dzien_otw_bil_var = tk.StringVar()
+dzien_bil_var = tk.StringVar()
+ttk.Label(period_frame, text="Od:").grid(row=0, column=0, padx=(0, 4))
+dzien_otw_bil_box = ttk.Entry(period_frame, textvariable=dzien_otw_bil_var, width=12, justify="center")
+dzien_otw_bil_box.grid(row=0, column=1)
+ttk.Label(period_frame, text="Do:").grid(row=0, column=2, padx=(12, 4))
+dzien_bil_box = ttk.Entry(period_frame, textvariable=dzien_bil_var, width=12, justify="center")
+dzien_bil_box.grid(row=0, column=3)
+restore_button = ttk.Button(period_frame, text="↺ Wg roku", width=10, command=lambda: apply_year(force=True))
+restore_button.grid(row=0, column=4, padx=(8, 0))
+period_label = ttk.Label(client_frame, style="Podpowiedz.TLabel")
+period_label.grid(row=3, column=1, padx=5, sticky=tk.W)
 
 ttk.Label(client_frame, text="Data podpisu umowy:").grid(row=5, column=0, padx=5, pady=5, sticky=tk.W)
 data_podpisu_umowy_var = tk.StringVar()
@@ -814,6 +914,14 @@ data_podpisu_badania_var = tk.StringVar(value=datetime.today().strftime("%d.%m.%
 data_podpisu_badania_box = ttk.Entry(client_frame, textvariable=data_podpisu_badania_var, state=tk.DISABLED)
 data_podpisu_badania_box.grid(row=9, column=1, padx=5, pady=5, sticky=(tk.W, tk.E))
 
+for date_box, date_var in ((dzien_otw_bil_box, dzien_otw_bil_var), (dzien_bil_box, dzien_bil_var),
+                           (data_podpisu_umowy_box, data_podpisu_umowy_var),
+                           (data_podpisu_badania_box, data_podpisu_badania_var)):
+    date_box.bind("<FocusOut>", lambda e, var=date_var: normalize_date_entry(var))
+dzien_otw_bil_var.trace_add("write", on_period_change)
+dzien_bil_var.trace_add("write", on_period_change)
+set_year(date.today().year - 1)
+
 separator2 = ttk.Separator(main_frame, orient='horizontal')
 separator2.grid(row=4, column=0, columnspan=2, sticky='ew', pady=10)
 
@@ -833,5 +941,13 @@ ttk.Label(main_frame, textvariable=status_var, foreground="gray").grid(row=6, co
 # Show the local copy right away, then fetch what changed in SharePoint since the last run.
 load_data()
 show_data_status()
+root.update_idletasks()
+work_left, work_top, work_right, work_bottom = work_area()
+if root.winfo_reqheight() + WINDOW_FRAME > work_bottom - work_top:
+    # Small screen: tighten the form so the buttons stay above the taskbar.
+    style.configure('TLabel', padding=1)
+    for widget in client_frame.grid_slaves():
+        widget.grid_configure(pady=1)
+center_on_screen(root)
 root.after(100, refresh_data, False)  # once the window is shown, so the sign-in window can open over it
 root.mainloop()

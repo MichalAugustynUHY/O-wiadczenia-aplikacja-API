@@ -716,6 +716,11 @@ def open_consolidation_dialog():
 auto_period = None   # (od, do) last filled in from the year
 applied_year = None
 
+def default_year():
+    """Last year until the end of July, this year from 1 August."""
+    today = date.today()
+    return today.year if today.month >= 8 else today.year - 1
+
 def set_year(year):
     year_var.set(str(year))
     apply_year(force=True)
@@ -920,7 +925,7 @@ for date_box, date_var in ((dzien_otw_bil_box, dzien_otw_bil_var), (dzien_bil_bo
     date_box.bind("<FocusOut>", lambda e, var=date_var: normalize_date_entry(var))
 dzien_otw_bil_var.trace_add("write", on_period_change)
 dzien_bil_var.trace_add("write", on_period_change)
-set_year(date.today().year - 1)
+set_year(default_year())
 
 separator2 = ttk.Separator(main_frame, orient='horizontal')
 separator2.grid(row=4, column=0, columnspan=2, sticky='ew', pady=10)
